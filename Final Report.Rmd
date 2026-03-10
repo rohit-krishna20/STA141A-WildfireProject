@@ -1,0 +1,391 @@
+---
+title: "STA 141A:  Predicting Wildfire Incidence in the United States"
+author: "(Rohit Krishna)"  
+output: html_document
+---
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(slider)
+library(pROC)
+library(randomForest)
+library(knitr)
+library(kableExtra)
+```
+
+
+
+## Abstract
+
+In this paper, the problem of predicting wildfires is modeled as a binary classification problem with spatial and temporal characteristics. Specifically, a notable wildfire is defined as a wildfire with a final burned area of at least 300 acres. The modeling unit is defined as the state-month, and the binary classification is defined as 1 if a state has at least one notable wildfire in a month and 0 otherwise. In addition, the performance of the logistic regression model is compared with a random forest model with lagged wildfire history and seasonal predictors. The performance of the two models is assessed using time-aware validation with Area Under the ROC Curve (AUC). The results demonstrate that the random forest model has stronger out-of-sample discrimination ability, whereas the logistic regression model is simpler and more interpretable.
+
+
+## Introduction
+
+Wildfire is a critical environmental hazard in the United States, which has been escalating over the years in terms of frequency and intensity. The understanding of the various aspects of wildland fire incidence helps in the prediction of such occurrences, which in turn helps in controlling them. In this report, we aim to study the wildland fire incidence in the United States, followed by the creation of a model to predict the wildland fire incidence in the country.
+
+
+
+
+
+
+### 1. Data Preprocessing
+
+
+In this section, I convert the wildfire data into a panel format for binary classification. As recommended in the project setup, a wildfire is considered notable if its size is at least 300 acres. In this case, for each state and month, my response variable takes a value of 1 if at least one notable wildfire occurs in a given month, otherwise 0. My predictors include lagged wildfire variables, lagged counts, rolling counts, historical rates, and seasonal variables. I make sure that all combinations of states and months are filled in so that months without a wildfire can be identified by a response variable of 0.
+
+```{r}
+
+
+
+wildfires <- read_csv("wildfires_sample_100k.csv", show_col_types = FALSE) %>%
+  clean_names()
+
+glimpse(wildfires)
+
+notable_cutoff <- 300
+
+wildfires2 <- wildfires %>%
+  mutate(
+    discovery_date_num = as.numeric(discovery_date),
+    cont_date_num = as.numeric(cont_date),
+    discovery_date_clean = as.Date(discovery_date_num - 2415018.5, origin = "1899-12-30"),
+    cont_date_clean = as.Date(cont_date_num - 2415018.5, origin = "1899-12-30"),
+    month_date = floor_date(discovery_date_clean, unit = "month"),
+    month = month(month_date),
+    year = year(month_date),
+    notable_fire = if_else(fire_size >= notable_cutoff, 1L, 0L),
+    lightning_fire = if_else(stat_cause_descr == "Lightning", 1L, 0L)
+  ) %>%
+  filter(!is.na(state), !is.na(month_date), !is.na(year), !is.na(month))
+
+state_month_raw <- wildfires2 %>%
+  group_by(state, month_date, year, month) %>%
+  summarise(
+    any_notable = as.integer(any(notable_fire == 1)),
+    notable_count = sum(notable_fire, na.rm = TRUE),
+    total_fires = n(),
+    avg_fire_size = mean(fire_size, na.rm = TRUE),
+    max_fire_size = max(fire_size, na.rm = TRUE),
+    lightning_share = mean(lightning_fire, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+all_states <- sort(unique(wildfires2$state))
+all_months <- seq(min(state_month_raw$month_date), max(state_month_raw$month_date), by = "month")
+
+state_month <- expand_grid(
+  state = all_states,
+  month_date = all_months
+) %>%
+  mutate(
+    year = year(month_date),
+    month = month(month_date)
+  ) %>%
+  left_join(state_month_raw, by = c("state", "month_date", "year", "month")) %>%
+  mutate(
+    any_notable = replace_na(any_notable, 0L),
+    notable_count = replace_na(notable_count, 0),
+    total_fires = replace_na(total_fires, 0),
+    avg_fire_size = replace_na(avg_fire_size, 0),
+    max_fire_size = replace_na(max_fire_size, 0),
+    lightning_share = replace_na(lightning_share, 0)
+  ) %>%
+  arrange(state, month_date) %>%
+  group_by(state) %>%
+  mutate(
+    lag_any_1 = lag(any_notable, 1),
+    lag_any_2 = lag(any_notable, 2),
+    lag_any_3 = lag(any_notable, 3),
+    lag_any_12 = lag(any_notable, 12),
+    lag_notable_1 = lag(notable_count, 1),
+    lag_notable_12 = lag(notable_count, 12),
+    lag_total_1 = lag(total_fires, 1),
+    lag_total_12 = lag(total_fires, 12),
+    lag_lightning_share_1 = lag(lightning_share, 1),
+    roll_notable_3 = slide_dbl(lag(notable_count, 1), ~sum(.x, na.rm = TRUE), .before = 2, .complete = TRUE),
+    roll_notable_12 = slide_dbl(lag(notable_count, 1), ~sum(.x, na.rm = TRUE), .before = 11, .complete = TRUE),
+    cum_notable_prior = lag(cumsum(notable_count), 1),
+    month_index = row_number(),
+    hist_rate = if_else(month_index > 1, cum_notable_prior / (month_index - 1), NA_real_),
+    month_sin = sin(2 * pi * month / 12),
+    month_cos = cos(2 * pi * month / 12)
+  ) %>%
+  ungroup()
+
+model_df <- state_month %>%
+  filter(!is.na(lag_any_12), !is.na(roll_notable_12), !is.na(hist_rate))
+
+summary_tbl <- tibble(
+  Metric = c(
+    "Notable-fire cutoff (acres)",
+    "Spatial unit",
+    "Temporal unit",
+    "Number of states",
+    "Years covered",
+    "Number of state-month rows",
+    "Positive state-months",
+    "Positive rate",
+    "Predictors"
+  ),
+  Value = c(
+    notable_cutoff,
+    "State",
+    "Month",
+    n_distinct(model_df$state),
+    paste0(min(model_df$year), " - ", max(model_df$year)),
+    nrow(model_df),
+    sum(model_df$any_notable),
+    round(mean(model_df$any_notable), 3),
+    "Lagged wildfire indicators, lagged counts, rolling counts, lightning share, historical rate, seasonal terms"
+  )
+)
+
+kable(summary_tbl, caption = "Summary of final modeling dataset") %>%
+  kable_styling(full_width = FALSE)
+
+
+
+```
+
+
+### 2. Exploratory Data Analysis  
+
+This section determines the primary spatial and temporal trends in the wildfire data and relate this to the modeling choices. The following plots show the variability in the number of wildfires by state and the seasonality in the data. This supports the use of historical risk measures specific to location and season in the modeling.
+
+```{r}
+
+
+
+state_incidence <- model_df %>%
+  group_by(state) %>%
+  summarise(positive_rate = mean(any_notable), .groups = "drop") %>%
+  arrange(desc(positive_rate))
+
+ggplot(state_incidence, aes(x = reorder(state, positive_rate), y = positive_rate)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Share of state-months with at least one notable wildfire",
+    x = "State",
+    y = "Positive state-month rate"
+  )
+```
+From the distribution of the incidence of wildfires across states, it is evident that there is geographic variation. In some states, there is a higher percentage of months with wildfires compared to others. This is attributed to the different climatic conditions and vegetation cover in different states. States with drier and warmer climates have a higher incidence of wildfires compared to states with colder and wetter climates.
+
+
+```{r}
+  
+monthly_seasonality <- model_df %>%
+  group_by(month) %>%
+  summarise(avg_prob = mean(any_notable), .groups = "drop")
+
+ggplot(monthly_seasonality, aes(x = month, y = avg_prob)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    title = "Average probability of a notable wildfire by month",
+    x = "Month",
+    y = "Average probability"
+  )
+```
+
+As shown in the monthly trend plot, there are clear indications of seasonality in the pattern of wildfires. It appears that there are more wild fires during the summer months than during the winter months, as this period experiences hotter temperatures compared to the winter months, which are usually cold and wet. The opposite of this is true during the winter months, as the incidence of wild fires is usually low during this period.
+
+
+```{r}
+
+model_df %>%
+  mutate(outcome = factor(any_notable, levels = c(0, 1), labels = c("No notable fire", "Notable fire"))) %>%
+  ggplot(aes(x = outcome, y = hist_rate, fill = outcome)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(
+    title = "Historical wildfire rate by outcome",
+    x = "",
+    y = "Historical notable-fire rate"
+  )
+```
+
+The state-months for which a notable wildfire occurred tend to have higher historical wildfire rates than those for which no notable wildfire occurred. This indicates that past wildfire activity can be a useful guide in forecasting future wildfire risks, supporting the inclusion of lagged/cumulative wildfire history variables in the models.
+
+
+
+### 3. Modeling
+
+Two predictive models have been used to forecast the probability of the incidence of wildfires. These include the logistic regression method and the random forest method. In the first instance, the logistic regression method is used because it is a linear method. However, the random forest method is used because it is nonlinear.
+
+The performance of the two predictive models has been assessed using the area under the ROC curve. It is observed that the random forest method has a higher value compared to the logistic regression method. This is because the nonlinear method is effective in the prediction of environmental processes.
+
+
+\[
+\text{logit}\{P(Y_{s,t}=1)\}
+=
+\beta_0
++ \beta_1 \text{lag\_any\_1}
++ \beta_2 \text{lag\_any\_2}
++ \beta_3 \text{lag\_any\_3}
++ \beta_4 \text{lag\_any\_12}
++ \beta_5 \text{lag\_notable\_1}
++ \beta_6 \text{lag\_notable\_12}
++ \beta_7 \text{lag\_total\_1}
++ \beta_8 \text{lag\_total\_12}
++ \beta_9 \text{roll\_notable\_3}
++ \beta_{10} \text{roll\_notable\_12}
++ \beta_{11} \text{hist\_rate}
++ \beta_{12} \text{lag\_lightning\_share\_1}
++ \beta_{13} \sin(2\pi m/12)
++ \beta_{14} \cos(2\pi m/12)
+\]
+
+```{r}
+
+predictor_formula <- any_notable ~
+  lag_any_1 + lag_any_2 + lag_any_3 + lag_any_12 +
+  lag_notable_1 + lag_notable_12 +
+  lag_total_1 + lag_total_12 +
+  roll_notable_3 + roll_notable_12 +
+  hist_rate + lag_lightning_share_1 +
+  month_sin + month_cos
+```
+
+
+
+
+### 4. Model Fitting and Validation
+
+To assess the performance of the model over time, rolling validation was performed on the model based on historical data. The AUC values are relatively stable over different validation intervals, implying a good ability of the model to generalize to new data. This shows that the model is picking up on long-term trends in the incidence of wildfires, as opposed to overfitting to specific time intervals.
+
+```{r}
+
+
+
+holdout_years <- sort(unique(model_df$year))
+holdout_years <- holdout_years[holdout_years >= min(holdout_years) + 3]
+
+auc_results <- map_dfr(holdout_years, function(test_year) {
+  train_df <- model_df %>% filter(year < test_year)
+  test_df <- model_df %>% filter(year == test_year)
+
+  log_fit <- glm(predictor_formula, data = train_df, family = binomial)
+  log_prob <- predict(log_fit, newdata = test_df, type = "response")
+  log_auc <- as.numeric(auc(test_df$any_notable, log_prob))
+
+  train_rf <- train_df %>% mutate(any_notable_f = factor(any_notable, levels = c(0, 1)))
+  test_rf <- test_df %>% mutate(any_notable_f = factor(any_notable, levels = c(0, 1)))
+
+  rf_formula <- any_notable_f ~
+    lag_any_1 + lag_any_2 + lag_any_3 + lag_any_12 +
+    lag_notable_1 + lag_notable_12 +
+    lag_total_1 + lag_total_12 +
+    roll_notable_3 + roll_notable_12 +
+    hist_rate + lag_lightning_share_1 +
+    month_sin + month_cos
+
+  rf_fit <- randomForest(rf_formula, data = train_rf, ntree = 300, importance = TRUE)
+  rf_prob <- predict(rf_fit, newdata = test_rf, type = "prob")[, "1"]
+  rf_auc <- as.numeric(auc(test_df$any_notable, rf_prob))
+
+  tibble(
+    holdout_year = test_year,
+    logistic_auc = log_auc,
+    random_forest_auc = rf_auc
+  )
+})
+
+auc_results
+
+auc_summary <- auc_results %>%
+  summarise(
+    logistic_mean_auc = mean(logistic_auc),
+    random_forest_mean_auc = mean(random_forest_auc)
+  )
+
+kable(auc_results, digits = 3, caption = "Rolling yearly holdout AUC by model") %>%
+  kable_styling(full_width = FALSE)
+
+kable(auc_summary, digits = 3, caption = "Average AUC across holdout years") %>%
+  kable_styling(full_width = FALSE)
+  
+auc_long <- auc_results %>%
+  pivot_longer(cols = c(logistic_auc, random_forest_auc), names_to = "model", values_to = "auc") %>%
+  mutate(
+    model = recode(
+      model,
+      logistic_auc = "Logistic Regression",
+      random_forest_auc = "Random Forest"
+    )
+  )
+
+ggplot(auc_long, aes(x = holdout_year, y = auc, color = model)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "AUC by holdout year",
+    x = "Holdout year",
+    y = "AUC",
+    color = "Model"
+  )
+```
+
+The comparison of AUC shows how the performance is changing with time and whether one model is performing better consistently than the other. Therefore, This is a direct comparison of two models using a time-respecting validation approach.
+
+```{r}
+
+final_year <- max(holdout_years)
+
+train_df <- model_df %>% filter(year < final_year)
+test_df <- model_df %>% filter(year == final_year)
+
+log_fit_final <- glm(predictor_formula, data = train_df, family = binomial)
+log_prob_final <- predict(log_fit_final, newdata = test_df, type = "response")
+
+train_rf <- train_df %>% mutate(any_notable_f = factor(any_notable, levels = c(0, 1)))
+test_rf <- test_df %>% mutate(any_notable_f = factor(any_notable, levels = c(0, 1)))
+
+rf_formula <- any_notable_f ~
+  lag_any_1 + lag_any_2 + lag_any_3 + lag_any_12 +
+  lag_notable_1 + lag_notable_12 +
+  lag_total_1 + lag_total_12 +
+  roll_notable_3 + roll_notable_12 +
+  hist_rate + lag_lightning_share_1 +
+  month_sin + month_cos
+
+rf_fit_final <- randomForest(rf_formula, data = train_rf, ntree = 300, importance = TRUE)
+rf_prob_final <- predict(rf_fit_final, newdata = test_rf, type = "prob")[, "1"]
+
+roc_log <- roc(test_df$any_notable, log_prob_final, quiet = TRUE)
+roc_rf <- roc(test_df$any_notable, rf_prob_final, quiet = TRUE)
+
+plot(roc_log, col = "steelblue", main = paste("ROC Curves for Holdout Year", final_year))
+plot(roc_rf, add = TRUE, col = "firebrick")
+legend(
+  "bottomright",
+  legend = c(
+    paste0("Logistic Regression AUC = ", round(as.numeric(auc(roc_log)), 3)),
+    paste0("Random Forest AUC = ", round(as.numeric(auc(roc_rf)), 3))
+  ),
+  col = c("steelblue", "firebrick"),
+  lwd = 2
+)
+
+varImpPlot(rf_fit_final, main = "Random Forest Variable Importance")
+```
+
+The variable importance plot shows which variables contribute the most to this model of random forest. Variables related to wildfire history and seasonality seem to be contributing a lot to this model, which is in accordance with the exploratory data analysis results.
+
+
+
+
+### 5. Conclusion
+
+This analysis was based on the examination of the patterns of wildfires occurring in the United States of America, based on state-month data aggregation. The exploratory findings indicated a strong geographic effect as well as clear seasonal patterns of wildfires. As indicated by the findings of the predictive modeling, the results show that fire activity, lightning-caused fire, and fire size are important predictors of wildfires. Out of all the models used, the random forest model performed best, implying that machine learning models are more effective in modeling complex relationships than other models. As indicated, the findings show that the history of wildfires can be used to generate important insights regarding the prediction of wildfires.
+
+GitHub repository for reproducibility: https://github.com/rohit-krishna20/STA141A-WildfireProject
+
