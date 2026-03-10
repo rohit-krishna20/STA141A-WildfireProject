@@ -1,8 +1,7 @@
-# STA141A-WildfireProject
+# STA 141A Wildfire Prediction Project
+
 Wildfire prediction project for STA 141A
 
-
-STA 141A Wildfire Prediction Project
 
 Files included:
 - Final_Report.Rmd (code used to generate the report)
